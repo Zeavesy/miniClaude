@@ -1,61 +1,15 @@
 """
-工具注册表 —— 纯注册与分发逻辑，不包含任何工具实现。
-工具实现位于 tools/ 目录下。
+工具注册表 —— 全局工具实例注册。
+ToolRegistry 类定义在 core/registry.py 中（因 subagent 也需使用，避免循环导入）。
 """
-import time
 from pathlib import Path
 
+from core.llm_client import LLMClient
+from core.registry import ToolRegistry
 from tools import run_bash, run_read, run_write, run_edit, run_glob
 from managers import TodoManager, TaskManager, BackgroundManager
 from skills import SkillLoader
-
-
-class ToolRegistry:
-    """统一管理工具：注册 → Schema 生成 → 分发执行。"""
-
-    def __init__(self):
-        self._tools: dict[str, dict] = {}
-
-    def register(self, name: str, description: str, handler, properties: dict,
-                 required: list[str] = None):
-        self._tools[name] = {
-            "name": name,
-            "description": description,
-            "handler": handler,
-            "input_schema": {
-                "type": "object",
-                "properties": properties,
-                "required": required or [],
-            },
-        }
-
-    def get_schemas(self) -> list[dict]:
-        return [
-            {"name": t["name"], "description": t["description"],
-             "input_schema": t["input_schema"]}
-            for t in self._tools.values()
-        ]
-
-    def dispatch(self, name: str, inputs: dict) -> str:
-        tool = self._tools.get(name)
-        if tool is None:
-            return f"未知工具: {name}"
-        start = time.time()
-        try:
-            result = tool["handler"](**inputs)
-        except Exception as e:
-            result = f"Error: {e}"
-        elapsed = (time.time() - start) * 1000
-        if len(str(result)) > 500:
-            print(f"  [{name}] {len(str(result))} 字节, {elapsed:.0f}ms")
-        return str(result)
-
-    def has(self, name: str) -> bool:
-        return name in self._tools
-
-    @property
-    def tool_names(self) -> list[str]:
-        return list(self._tools.keys())
+from subagent import run_subagent
 
 
 # ── 全局注册表 + 全部工具注册 ────────────────────────────────
@@ -162,3 +116,24 @@ registry.register("load_skill", "按需加载技能知识。传入技能名，�
                   lambda **kw: skill_loader.get_content(kw["name"]),
                   {"name": {"type": "string", "description": "要加载的技能名称"}},
                   required=["name"])
+
+# ── SubAgent 工具（subagent/runner）────────────────────────────
+
+_registry_client = None  # 由 main.py 注入，供 task handler 使用
+
+def _get_client():
+    global _registry_client
+    if _registry_client is None:
+        _registry_client = LLMClient()
+    return _registry_client
+
+# 允许 main.py 注入共享 client
+def set_registry_client(client):
+    global _registry_client
+    _registry_client = client
+
+registry.register("task", "派生子代理执行任务。子代理拥有全新上下文（messages=[]），与父代理共享文件系统，完成后返回摘要。适合需要上下文隔离的探索或子任务。",
+                  lambda **kw: run_subagent(kw["prompt"], _get_client(), WORKDIR),
+                  {"prompt": {"type": "string", "description": "子代理的任务描述"},
+                   "description": {"type": "string", "description": "任务简短描述"}},
+                  required=["prompt"])
