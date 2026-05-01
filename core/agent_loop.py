@@ -80,7 +80,7 @@ def agent_loop(
                 })
 
         # ── LLM 调用 ───────────────────────────────────────────
-        response = client.chat(
+        response = client.chat_stream(
             messages=messages,
             system=system,
             tools=schemas,
@@ -96,21 +96,21 @@ def agent_loop(
         manual_compact = False
 
         for block in response.content:
-            if block.type == "tool_use":
-                print(f"\033[33m> {block.name}\033[0m")
-                if block.name == "compact":
+            if block["type"] == "tool_use":
+                print(f"\033[33m> {block['name']}\033[0m")
+                if block["name"] == "compact":
                     # 标记手动压缩——在工具结果注入后再触发
                     manual_compact = True
                     output = "Compressing..."
                 else:
-                    output = tools_registry.dispatch(block.name, block.input)
+                    output = tools_registry.dispatch(block["name"], block["input"])
                 print(str(output)[:200])
                 results.append({
                     "type": "tool_result",
-                    "tool_use_id": block.id,
+                    "tool_use_id": block["id"],
                     "content": output,
                 })
-                if block.name == "TodoWrite":
+                if block["name"] == "TodoWrite":
                     used_todo = True
 
         # ── Todo nag reminder ──────────────────────────────────

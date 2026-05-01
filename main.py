@@ -80,12 +80,6 @@ def main():
             team_bus=team_bus,
         )
 
-        # 打印最后一条 assistant 回复中的文本
-        response_content = history[-1]["content"]
-        if isinstance(response_content, list):
-            for block in response_content:
-                if hasattr(block, "text"):
-                    print(block.text)
         print()
 
 
