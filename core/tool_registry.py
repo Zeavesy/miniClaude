@@ -7,6 +7,7 @@ from pathlib import Path
 
 from tools import run_bash, run_read, run_write, run_edit, run_glob
 from managers import TodoManager, TaskManager, BackgroundManager
+from skills import SkillLoader
 
 
 class ToolRegistry:
@@ -65,6 +66,7 @@ WORKDIR = Path.cwd()
 todo_mgr = TodoManager()
 task_mgr = TaskManager(WORKDIR / ".tasks")
 bg_mgr = BackgroundManager(WORKDIR)
+skill_loader = SkillLoader(WORKDIR / "skills")
 
 registry = ToolRegistry()
 
@@ -153,3 +155,10 @@ registry.register("check_background", "查询后台任务状态。省略 task_id
 registry.register("compact", "手动触发对话压缩。长对话时可主动调用以释放上下文窗口。",
                   lambda **kw: "Compressing...",
                   {"focus": {"type": "string", "description": "希望在摘要中重点保留的内容"}})
+
+# ── Skill 工具（skills/loader）────────────────────────────────
+
+registry.register("load_skill", "按需加载技能知识。传入技能名，返回完整的领域指导文档。",
+                  lambda **kw: skill_loader.get_content(kw["name"]),
+                  {"name": {"type": "string", "description": "要加载的技能名称"}},
+                  required=["name"])
