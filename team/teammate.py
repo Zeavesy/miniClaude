@@ -12,12 +12,15 @@ TeammateManager — 持久化命名队友的线程管理。
 
 import json
 import threading
+import time
+import uuid
 from pathlib import Path
 
 from core.llm_client import LLMClient
 from core.tool_registry import ToolRegistry
 from tools import run_bash, run_read, run_write, run_edit, run_glob
 from team.message_bus import MessageBus, VALID_MSG_TYPES
+from team.protocols import shutdown_requests, plan_requests, _tracker_lock
 
 
 class TeammateManager:
@@ -39,12 +42,15 @@ class TeammateManager:
 
     def _load_config(self) -> dict:
         if self.config_path.exists():
-            return json.loads(self.config_path.read_text(encoding="utf-8"))
+            text = self.config_path.read_text(encoding="utf-8").strip()
+            if text:
+                return json.loads(text)
         return {"team_name": "default", "members": []}
 
     def _save_config(self):
         self.config_path.write_text(
-            json.dumps(self.config, indent=2, ensure_ascii=False), encoding="utf-8"
+            json.dumps(self.config, indent=2, ensure_ascii=False),
+            encoding="utf-8",
         )
 
     def _find_member(self, name: str) -> dict | None:
@@ -105,34 +111,38 @@ class TeammateManager:
     # ══════════════════════════════════════════════════════════
 
     def _teammate_loop(self, name: str, role: str, prompt: str):
-        """精简版 agent_loop：无 nag/bg/compact，只做 inbox 感知的循环。"""
+        """精简版 agent_loop：支持 shutdown_request 退出 + plan_approval 提交。"""
         sys_prompt = (
             f"You are '{name}', role: {role}. "
-            f"Use send_message to communicate with teammates. "
-            f"Read your inbox periodically. Complete your task."
+            # f"Submit plans via plan_approval before major work. "
+            # f"Respond to shutdown_request with shutdown_response. "
+            # f"Use send_message to communicate. Complete your task."
+            f"RULES (text replies are invisible to the protocol — only tool calls count):\n"
+            f"1. For risky/destructive work: FIRST call plan_approval tool with your plan. "
+            f"Do NOT start work until lead approves via plan_approval_response.\n"
+            f"2. On shutdown_request: IMMEDIATELY call shutdown_response tool with approve=true.\n"
+            f"3. To communicate: call send_message tool. Never use plain text for important info.\n"
+            f"Your first action after receiving any message MUST be a tool call, not text."
         )
         messages = [{"role": "user", "content": prompt}]
         tools = self._teammate_tools()
-        schemas = [{
-            "name": t["name"], "description": t["description"],
-            "input_schema": t["input_schema"]
-        } for t in tools]
 
-        for _ in range(50):  # 安全上限
-            # 读取 inbox，注入消息
+        should_exit = False
+        for _ in range(50):
             inbox = self.bus.read_inbox(name)
             for msg in inbox:
                 messages.append({"role": "user", "content": json.dumps(msg, ensure_ascii=False)})
+            if should_exit:
+                break
 
             try:
                 response = self._client.chat(
-                    messages=messages, system=sys_prompt, tools=schemas,
+                    messages=messages, system=sys_prompt, tools=tools,
                 )
             except Exception:
                 break
 
             messages.append({"role": "assistant", "content": response.content})
-
             if response.stop_reason != "tool_use":
                 break
 
@@ -145,12 +155,15 @@ class TeammateManager:
                         "tool_use_id": block.id,
                         "content": str(output),
                     })
+                    # shutdown_response(approve=true) → 标记退出
+                    if block.name == "shutdown_response" and block.input.get("approve"):
+                        should_exit = True
             messages.append({"role": "user", "content": results})
 
-        # 退出后标记 idle
+        # 退出后标记最终状态
         member = self._find_member(name)
-        if member and member["status"] != "shutdown":
-            member["status"] = "idle"
+        if member:
+            member["status"] = "shutdown" if should_exit else "idle"
             self._save_config()
 
     # ══════════════════════════════════════════════════════════
@@ -171,6 +184,27 @@ class TeammateManager:
                                  args.get("msg_type", "message"))
         if tool_name == "read_inbox":
             return json.dumps(self.bus.read_inbox(sender), indent=2, ensure_ascii=False)
+        if tool_name == "shutdown_response":
+            req_id = args["request_id"]
+            approve = args["approve"]
+            with _tracker_lock:
+                if req_id in shutdown_requests:
+                    shutdown_requests[req_id]["status"] = "approved" if approve else "rejected"
+            self.bus.send(
+                sender, "lead", args.get("reason", ""),
+                "shutdown_response", {"request_id": req_id, "approve": approve},
+            )
+            return f"Shutdown {'approved' if approve else 'rejected'}"
+        if tool_name == "plan_approval":
+            plan_text = args.get("plan", "")
+            req_id = str(uuid.uuid4())[:8]
+            with _tracker_lock:
+                plan_requests[req_id] = {"from": sender, "plan": plan_text, "status": "pending"}
+            self.bus.send(
+                sender, "lead", plan_text, "plan_approval_response",
+                {"request_id": req_id, "plan": plan_text},
+            )
+            return f"Plan submitted (request_id={req_id}). Waiting for lead approval."
         return f"Unknown tool: {tool_name}"
 
     def _teammate_tools(self) -> list[dict]:
@@ -188,4 +222,8 @@ class TeammateManager:
              "input_schema": {"type": "object", "properties": {"to": {"type": "string"}, "content": {"type": "string"}, "msg_type": {"type": "string", "enum": list(VALID_MSG_TYPES)}}, "required": ["to", "content"]}},
             {"name": "read_inbox", "description": "Read and drain your inbox.",
              "input_schema": {"type": "object", "properties": {}}},
+            {"name": "shutdown_response", "description": "Respond to a shutdown request. Approve to shut down, reject to keep working.",
+             "input_schema": {"type": "object", "properties": {"request_id": {"type": "string"}, "approve": {"type": "boolean"}, "reason": {"type": "string"}}, "required": ["request_id", "approve"]}},
+            {"name": "plan_approval", "description": "Submit a plan for lead approval. Provide plan text.",
+             "input_schema": {"type": "object", "properties": {"plan": {"type": "string"}}, "required": ["plan"]}},
         ]

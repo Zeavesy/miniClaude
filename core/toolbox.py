@@ -13,6 +13,7 @@ from skills import SkillLoader
 from subagent import run_subagent
 from team import MessageBus, TeammateManager
 from team.message_bus import VALID_MSG_TYPES
+from team.protocols import handle_shutdown_request, check_shutdown_status, handle_plan_review
 
 
 # ── 全局注册表 + 全部工具注册 ────────────────────────────────
@@ -149,6 +150,25 @@ registry.register("broadcast", "向所有队友发送广播消息。",
                   lambda **kw: team_bus.broadcast("lead", kw["content"], team_mgr.member_names()),
                   {"content": {"type": "string"}},
                   required=["content"])
+
+# ── Team Protocols 工具（team/protocols）───────────────────────
+
+registry.register("shutdown_request", "向指定队友发送关机请求。返回 request_id 用于追踪状态。",
+                  lambda **kw: handle_shutdown_request(kw["teammate"], team_bus),
+                  {"teammate": {"type": "string"}},
+                  required=["teammate"])
+
+registry.register("shutdown_response", "查询关机请求的状态（按 request_id）。",
+                  lambda **kw: check_shutdown_status(kw.get("request_id", "")),
+                  {"request_id": {"type": "string"}},
+                  required=["request_id"])
+
+registry.register("plan_approval", "审查队友提交的计划：approve=true 批准，false 拒绝，可选 feedback。",
+                  lambda **kw: handle_plan_review(kw["request_id"], kw["approve"],
+                                                   kw.get("feedback", ""), team_bus),
+                  {"request_id": {"type": "string"}, "approve": {"type": "boolean"},
+                   "feedback": {"type": "string"}},
+                  required=["request_id", "approve"])
 
 # ── SubAgent 工具（subagent/runner）────────────────────────────
 

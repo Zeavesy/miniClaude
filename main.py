@@ -22,6 +22,7 @@ SYSTEM = f"""你是一个在 {WORKDIR} 工作的编程助手（Team Lead）。
 使用 TodoWrite 跟踪多步骤任务，使用 task_create/task_update/task_list 管理持久化任务，
 使用 background_run 执行耗时命令，使用 task 派生子代理探索或执行独立子任务。
 使用 spawn_teammate 启动队友并行工作，通过 send_message/read_inbox/broadcast 与队友通信。
+使用 shutdown_request 优雅关闭队友，使用 plan_approval 审批队友提交的计划。
 当对话过长时使用 compact 压缩上下文。遇到陌生领域时，先调用 load_skill 加载知识再行动。
 
 可用技能:

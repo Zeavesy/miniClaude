@@ -56,9 +56,13 @@ class MessageBus:
         inbox_path = self.dir / f"{name}.jsonl"
         if not inbox_path.exists():
             return []
-        lines = inbox_path.read_text(encoding="utf-8").strip().splitlines()
+
+        messages = []
+        for line in inbox_path.read_text(encoding="utf-8").strip().splitlines():
+            if line:
+                messages.append(json.loads(line))
         inbox_path.write_text("")  # drain
-        return [json.loads(line) for line in lines if line]
+        return messages
 
     def broadcast(self, sender: str, content: str, teammates: list[str]) -> str:
         """给除 sender 外的所有队友发广播。"""
