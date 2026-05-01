@@ -14,6 +14,7 @@ from subagent import run_subagent
 from team import MessageBus, TeammateManager
 from team.message_bus import VALID_MSG_TYPES
 from team.protocols import handle_shutdown_request, check_shutdown_status, handle_plan_review
+from team.autonomous import claim_task as claim_task_fn
 
 
 # ── 全局注册表 + 全部工具注册 ────────────────────────────────
@@ -169,6 +170,17 @@ registry.register("plan_approval", "审查队友提交的计划：approve=true �
                   {"request_id": {"type": "string"}, "approve": {"type": "boolean"},
                    "feedback": {"type": "string"}},
                   required=["request_id", "approve"])
+
+# ── Autonomous 工具（team/autonomous）─────────────────────────
+
+registry.register("idle", "Lead 闲置（很少使用）。Teammate 则用 idle 进入轮询模式。",
+                  lambda **kw: "Lead does not idle.",
+                  {})
+
+registry.register("claim_task", "从 task board 认领一个未分配的任务。",
+                  lambda **kw: claim_task_fn(kw["task_id"], "lead", WORKDIR / ".tasks"),
+                  {"task_id": {"type": "integer"}},
+                  required=["task_id"])
 
 # ── SubAgent 工具（subagent/runner）────────────────────────────
 

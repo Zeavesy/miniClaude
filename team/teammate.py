@@ -15,12 +15,15 @@ import threading
 import time
 import uuid
 from pathlib import Path
+import os
 
 from core.llm_client import LLMClient
 from core.tool_registry import ToolRegistry
 from tools import run_bash, run_read, run_write, run_edit, run_glob
 from team.message_bus import MessageBus, VALID_MSG_TYPES
 from team.protocols import shutdown_requests, plan_requests, _tracker_lock
+from team.autonomous import (scan_unclaimed_tasks, claim_task,
+                              make_identity_block, POLL_INTERVAL, IDLE_TIMEOUT)
 
 
 class TeammateManager:
@@ -86,7 +89,7 @@ class TeammateManager:
         self._save_config()
 
         t = threading.Thread(
-            target=self._teammate_loop,
+            target=self._loop,
             args=(name, role, prompt),
             daemon=True,
         )
@@ -110,61 +113,118 @@ class TeammateManager:
     # 队友线程循环
     # ══════════════════════════════════════════════════════════
 
-    def _teammate_loop(self, name: str, role: str, prompt: str):
-        """精简版 agent_loop：支持 shutdown_request 退出 + plan_approval 提交。"""
+    def _loop(self, name: str, role: str, prompt: str):
+        """s11 自主生命周期：WORK → IDLE → POLL。"""
+        team_name = self.config["team_name"]
         sys_prompt = (
-            f"You are '{name}', role: {role}. "
-            # f"Submit plans via plan_approval before major work. "
-            # f"Respond to shutdown_request with shutdown_response. "
-            # f"Use send_message to communicate. Complete your task."
-            f"RULES (text replies are invisible to the protocol — only tool calls count):\n"
-            f"1. For risky/destructive work: FIRST call plan_approval tool with your plan. "
-            f"Do NOT start work until lead approves via plan_approval_response.\n"
-            f"2. On shutdown_request: IMMEDIATELY call shutdown_response tool with approve=true.\n"
-            f"3. To communicate: call send_message tool. Never use plain text for important info.\n"
-            f"Your first action after receiving any message MUST be a tool call, not text."
+            f"You are '{name}', role: {role}, team: {team_name}. "
+            f"RULES (text replies are invisible — only tool calls count):\n"
+            f"1. For risky/destructive work: FIRST call plan_approval tool. "
+            f"Do NOT start work until lead approves.\n"
+            f"2. On shutdown_request: call shutdown_response tool with approve=true.\n"
+            f"3. To communicate: call send_message tool.\n"
+            f"4. When you have no more work: call idle tool.\n"
+            f"Your first action MUST be a tool call, not text."
         )
         messages = [{"role": "user", "content": prompt}]
         tools = self._teammate_tools()
 
-        should_exit = False
-        for _ in range(50):
-            inbox = self.bus.read_inbox(name)
-            for msg in inbox:
-                messages.append({"role": "user", "content": json.dumps(msg, ensure_ascii=False)})
-            if should_exit:
-                break
+        while True:
+            # ════════════════════════════════════════════════════
+            # WORK PHASE — 标准 agent loop（最多 50 轮）
+            # ════════════════════════════════════════════════════
+            for _ in range(50):
+                inbox = self.bus.read_inbox(name)
+                for msg in inbox:
+                    if msg.get("type") == "shutdown_request":
+                        # 立即注入，LLM 决策后如有 approve 则退出
+                        messages.append({"role": "user",
+                                         "content": json.dumps(msg, ensure_ascii=False)})
+                    else:
+                        messages.append({"role": "user",
+                                         "content": json.dumps(msg, ensure_ascii=False)})
+                try:
+                    response = self._client.chat(
+                        messages=messages, system=sys_prompt, tools=tools,
+                    )
+                except Exception:
+                    self._set_status(name, "idle")
+                    return
 
-            try:
-                response = self._client.chat(
-                    messages=messages, system=sys_prompt, tools=tools,
-                )
-            except Exception:
-                break
+                messages.append({"role": "assistant", "content": response.content})
+                if response.stop_reason != "tool_use":
+                    break
 
-            messages.append({"role": "assistant", "content": response.content})
-            if response.stop_reason != "tool_use":
-                break
+                results = []
+                idle_requested = False
+                for block in response.content:
+                    if block.type == "tool_use":
+                        if block.name == "idle":
+                            idle_requested = True
+                            output = "Entering idle phase. Will poll for new tasks."
+                        else:
+                            output = self._exec_tool(name, block.name, block.input)
+                        print(f"  [{name}] {block.name}: {str(output)[:120]}")
+                        results.append({
+                            "type": "tool_result",
+                            "tool_use_id": block.id,
+                            "content": str(output),
+                        })
+                        if (block.name == "shutdown_response"
+                                and block.input.get("approve")):
+                            self._set_status(name, "shutdown")
+                            return
+                messages.append({"role": "user", "content": results})
+                if idle_requested:
+                    break
 
-            results = []
-            for block in response.content:
-                if block.type == "tool_use":
-                    output = self._exec_tool(name, block.name, block.input)
-                    results.append({
-                        "type": "tool_result",
-                        "tool_use_id": block.id,
-                        "content": str(output),
+            # ════════════════════════════════════════════════════
+            # IDLE PHASE — 轮询 inbox + 扫描 .tasks/
+            # ════════════════════════════════════════════════════
+            self._set_status(name, "idle")
+            resume = False
+            tasks_dir = self.dir.parent / ".tasks"
+            polls = IDLE_TIMEOUT // max(POLL_INTERVAL, 1)
+            for _ in range(polls):
+                time.sleep(POLL_INTERVAL)
+                # 检查 inbox
+                inbox = self.bus.read_inbox(name)
+                if inbox:
+                    for msg in inbox:
+                        if msg.get("type") == "shutdown_request":
+                            self._set_status(name, "shutdown")
+                            return
+                        messages.append({"role": "user",
+                                         "content": json.dumps(msg, ensure_ascii=False)})
+                    resume = True
+                    break
+                # 扫描 .tasks/
+                unclaimed = scan_unclaimed_tasks(tasks_dir)
+                if unclaimed:
+                    task = unclaimed[0]
+                    result = claim_task(task["id"], name, tasks_dir)
+                    if result.startswith("Error:"):
+                        continue
+                    # compact 后重新注入身份
+                    if len(messages) <= 3:
+                        messages.insert(0, make_identity_block(name, role, team_name))
+                        messages.insert(1, {"role": "assistant",
+                                            "content": f"I am {name}. Continuing."})
+                    messages.append({
+                        "role": "user",
+                        "content": (f"<auto-claimed>Task #{task['id']}: "
+                                    f"{task['subject']}\n"
+                                    f"{task.get('description', '')}</auto-claimed>"),
                     })
-                    # shutdown_response(approve=true) → 标记退出
-                    if block.name == "shutdown_response" and block.input.get("approve"):
-                        should_exit = True
-            messages.append({"role": "user", "content": results})
+                    messages.append({"role": "assistant",
+                                     "content": f"Claimed task #{task['id']}. Working on it."})
+                    resume = True
+                    break
 
-        # 退出后标记最终状态
-        member = self._find_member(name)
-        if member:
-            member["status"] = "shutdown" if should_exit else "idle"
-            self._save_config()
+            if not resume:
+                self._set_status(name, "shutdown")
+                return
+            self._set_status(name, "working")
 
     # ══════════════════════════════════════════════════════════
     # 队友工具集 + 分发
@@ -184,6 +244,9 @@ class TeammateManager:
                                  args.get("msg_type", "message"))
         if tool_name == "read_inbox":
             return json.dumps(self.bus.read_inbox(sender), indent=2, ensure_ascii=False)
+        if tool_name == "claim_task":
+            tasks_dir = self.dir.parent / ".tasks"
+            return claim_task(args["task_id"], sender, tasks_dir)
         if tool_name == "shutdown_response":
             req_id = args["request_id"]
             approve = args["approve"]
@@ -226,4 +289,8 @@ class TeammateManager:
              "input_schema": {"type": "object", "properties": {"request_id": {"type": "string"}, "approve": {"type": "boolean"}, "reason": {"type": "string"}}, "required": ["request_id", "approve"]}},
             {"name": "plan_approval", "description": "Submit a plan for lead approval. Provide plan text.",
              "input_schema": {"type": "object", "properties": {"plan": {"type": "string"}}, "required": ["plan"]}},
+            {"name": "idle", "description": "Signal no more work. Will auto-claim new tasks from the board.",
+             "input_schema": {"type": "object", "properties": {}}},
+            {"name": "claim_task", "description": "Claim a task from the task board by ID.",
+             "input_schema": {"type": "object", "properties": {"task_id": {"type": "integer"}}, "required": ["task_id"]}},
         ]
