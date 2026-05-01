@@ -87,6 +87,7 @@ class TaskManager:
             "description": description,
             "status": "pending",
             "blockedBy": [],
+            "worktree": "",
         }
         self._save(task)
         self._next_id += 1
@@ -156,8 +157,30 @@ class TaskManager:
                 "completed": "[x]",
             }.get(t["status"], "[?]")
             blocked = f" (依赖: {t['blockedBy']})" if t.get("blockedBy") else ""
-            lines.append(f"{marker} #{t['id']}: {t['subject']}{blocked}")
+            wt = f" wt={t['worktree']}" if t.get("worktree") else ""
+            lines.append(f"{marker} #{t['id']}: {t['subject']}{blocked}{wt}")
 
         done = sum(1 for t in tasks if t["status"] == "completed")
         lines.append(f"\n({done}/{len(tasks)} 完成)")
         return "\n".join(lines)
+
+    # ── s12: worktree 绑定 ─────────────────────────────────
+
+    def exists(self, task_id: int) -> bool:
+        return self._path(task_id).exists()
+
+    def bind_worktree(self, task_id: int, worktree: str, owner: str = "") -> str:
+        task = self._load(task_id)
+        task["worktree"] = worktree
+        if owner:
+            task["owner"] = owner
+        if task["status"] == "pending":
+            task["status"] = "in_progress"
+        self._save(task)
+        return json.dumps(task, indent=2, ensure_ascii=False)
+
+    def unbind_worktree(self, task_id: int) -> str:
+        task = self._load(task_id)
+        task["worktree"] = ""
+        self._save(task)
+        return json.dumps(task, indent=2, ensure_ascii=False)

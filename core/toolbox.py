@@ -15,6 +15,8 @@ from team import MessageBus, TeammateManager
 from team.message_bus import VALID_MSG_TYPES
 from team.protocols import handle_shutdown_request, check_shutdown_status, handle_plan_review
 from team.autonomous import claim_task as claim_task_fn
+from team.worktree import WorktreeManager, EventBus
+import subprocess
 
 
 # ── 全局注册表 + 全部工具注册 ────────────────────────────────
@@ -28,6 +30,23 @@ bg_mgr = BackgroundManager(WORKDIR)
 skill_loader = SkillLoader(WORKDIR / "skills")
 team_bus = MessageBus(WORKDIR / ".team" / "inbox")
 team_mgr = TeammateManager(WORKDIR / ".team", team_bus)
+
+# 检测 git repo 根目录（用于 worktree 工具）
+def _detect_repo_root(cwd: Path) -> Path:
+    try:
+        r = subprocess.run(["git", "rev-parse", "--show-toplevel"],
+                           cwd=cwd, capture_output=True, text=True, timeout=10)
+        if r.returncode == 0:
+            root = Path(r.stdout.strip())
+            if root.exists():
+                return root
+    except Exception:
+        pass
+    return cwd
+
+REPO_ROOT = _detect_repo_root(WORKDIR)
+wt_events = EventBus(REPO_ROOT / ".worktrees" / "events.jsonl")
+wt_mgr = WorktreeManager(REPO_ROOT, task_mgr, wt_events)
 
 registry = ToolRegistry()
 
@@ -181,6 +200,49 @@ registry.register("claim_task", "从 task board 认领一个未分配的任务�
                   lambda **kw: claim_task_fn(kw["task_id"], "lead", WORKDIR / ".tasks"),
                   {"task_id": {"type": "integer"}},
                   required=["task_id"])
+
+# ── Worktree 工具（team/worktree）─────────────────────────────
+
+registry.register("task_bind_worktree", "将任务绑定到 worktree。",
+                  lambda **kw: task_mgr.bind_worktree(kw["task_id"], kw["worktree"],
+                                                       kw.get("owner", "")),
+                  {"task_id": {"type": "integer"}, "worktree": {"type": "string"},
+                   "owner": {"type": "string"}},
+                  required=["task_id", "worktree"])
+
+registry.register("worktree_create", "创建 git worktree，可选绑定到任务。",
+                  lambda **kw: wt_mgr.create(kw["name"], kw.get("task_id"),
+                                              kw.get("base_ref", "HEAD")),
+                  {"name": {"type": "string"}, "task_id": {"type": "integer"},
+                   "base_ref": {"type": "string"}},
+                  required=["name"])
+
+registry.register("worktree_list", "列出 .worktrees/index.json 中所有 worktree。",
+                  lambda **kw: wt_mgr.list_all(), {})
+
+registry.register("worktree_status", "查看指定 worktree 的 git status。",
+                  lambda **kw: wt_mgr.status(kw["name"]),
+                  {"name": {"type": "string"}}, required=["name"])
+
+registry.register("worktree_run", "在指定 worktree 目录中执行命令。",
+                  lambda **kw: wt_mgr.run(kw["name"], kw["command"]),
+                  {"name": {"type": "string"}, "command": {"type": "string"}},
+                  required=["name", "command"])
+
+registry.register("worktree_remove", "删除 worktree，可选标记绑定任务为 completed。",
+                  lambda **kw: wt_mgr.remove(kw["name"], kw.get("force", False),
+                                              kw.get("complete_task", False)),
+                  {"name": {"type": "string"}, "force": {"type": "boolean"},
+                   "complete_task": {"type": "boolean"}},
+                  required=["name"])
+
+registry.register("worktree_keep", "标记 worktree 为保留，不删除。",
+                  lambda **kw: wt_mgr.keep(kw["name"]),
+                  {"name": {"type": "string"}}, required=["name"])
+
+registry.register("worktree_events", "列出最近的 worktree 生命周期事件。",
+                  lambda **kw: wt_events.list_recent(kw.get("limit", 20)),
+                  {"limit": {"type": "integer"}})
 
 # ── SubAgent 工具（subagent/runner）────────────────────────────
 

@@ -73,6 +73,7 @@ def agent_loop(
         if team_bus is not None:
             inbox = team_bus.read_inbox("lead")
             if inbox:
+                print("=========inboxInfo: ", inbox)
                 messages.append({
                     "role": "user",
                     "content": f"<inbox>{json.dumps(inbox, indent=2, ensure_ascii=False)}</inbox>",
