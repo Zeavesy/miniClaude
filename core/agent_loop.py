@@ -12,8 +12,10 @@
     │ 7. manual compact?— 模型主动触发压缩         │
     └─────────────────────────────────────────────┘
 """
+import json
+
 from core.llm_client import LLMClient
-from core.tool_registry import registry
+from core.toolbox import registry
 from managers import TodoManager, BackgroundManager
 from context import CompactManager
 
@@ -26,6 +28,7 @@ def agent_loop(
     todo_manager: TodoManager = None,
     bg_manager: BackgroundManager = None,
     compact_manager: CompactManager = None,
+    team_bus=None,  # MessageBus, 用于 drain lead inbox
 ):
     if client is None:
         client = LLMClient()
@@ -64,6 +67,15 @@ def agent_loop(
                 messages.append({
                     "role": "user",
                     "content": f"<background-results>\n{text}\n</background-results>",
+                })
+
+        # ── Lead inbox 检查 ────────────────────────────────────
+        if team_bus is not None:
+            inbox = team_bus.read_inbox("lead")
+            if inbox:
+                messages.append({
+                    "role": "user",
+                    "content": f"<inbox>{json.dumps(inbox, indent=2, ensure_ascii=False)}</inbox>",
                 })
 
         # ── LLM 调用 ───────────────────────────────────────────

@@ -23,7 +23,7 @@ SubAgent Runner —— 用全新 messages=[] 启动子代理执行任务。
 from pathlib import Path
 
 from core.llm_client import LLMClient
-from core.registry import ToolRegistry
+from core.tool_registry import ToolRegistry
 from tools import run_bash, run_read, run_write, run_edit, run_glob
 
 # 子代理的 system prompt — 强调任务完成 + 摘要返回
